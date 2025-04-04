@@ -4,62 +4,252 @@
   <meta charset="UTF-8">
   <title>MPU6050 3D Viewer</title>
   <style>
-    body { margin: 0; overflow: hidden; background: #000; }
+    body { margin: 0; overflow: hidden; background: #222; }
     canvas { display: block; }
+    .info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: white;
+      font-family: monospace;
+      background: rgba(0,0,0,0.5);
+      padding: 10px;
+      border-radius: 5px;
+    }
+    .controls {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      color: white;
+      font-family: monospace;
+      background: rgba(0,0,0,0.5);
+      padding: 10px;
+      border-radius: 5px;
+    }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 </head>
 <body>
+<div class="info">Sensor Data: <span id="sensorData">Waiting...</span></div>
+<div class="controls">
+  <button id="resetBtn">Reset Position</button>
+  <label><input type="checkbox" id="lockPosition" checked> Lock Z Position</label>
+  <div>Movement Sensitivity: <input type="range" min="1" max="100" value="20" id="moveSensitivity"></div>
+  <div>Rotation Sensitivity: <input type="range" min="1" max="100" value="10" id="rotSensitivity"></div>
+</div>
 <script>
+  // Scene setup
   const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x222222);
+  
+  // Camera setup with better position
   const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+  camera.position.z = 10;
+  camera.position.y = 5;
+  camera.position.x = 5;
+  camera.lookAt(0, 0, 0);
+  
+  // Renderer with better options
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
   document.body.appendChild(renderer.domElement);
-
-  const geometry = new THREE.BoxGeometry(1, 1, 1);
-  const material = new THREE.MeshNormalMaterial();
-  const cube = new THREE.Mesh(geometry, material);
+  
+  // Add lights for better depth perception
+  const ambientLight = new THREE.AmbientLight(0x404040);
+  scene.add(ambientLight);
+  
+  const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+  directionalLight.position.set(1, 1, 1);
+  scene.add(directionalLight);
+  
+  // Create a more visible box
+  const geometry = new THREE.BoxGeometry(2, 0.5, 3); // Different dimensions to clearly see orientation
+  
+  // Materials that better show depth
+  const materials = [
+    new THREE.MeshStandardMaterial({ color: 0xff0000 }), // right - red
+    new THREE.MeshStandardMaterial({ color: 0x00ff00 }), // left - green
+    new THREE.MeshStandardMaterial({ color: 0x0000ff }), // top - blue
+    new THREE.MeshStandardMaterial({ color: 0xffff00 }), // bottom - yellow
+    new THREE.MeshStandardMaterial({ color: 0xff00ff }), // front - magenta
+    new THREE.MeshStandardMaterial({ color: 0x00ffff })  // back - cyan
+  ];
+  
+  const cube = new THREE.Mesh(geometry, materials);
   scene.add(cube);
-
-  camera.position.z = 4;
-
+  
+  // Initial position and calibration values
+  const initialPosition = { x: 0, y: 0, z: 0 };
+  let calibration = { ax: 0, ay: 0, az: -9.8 }; // Default calibration (assumes sensor resting flat)
+  
+  // Add coordinate axes for reference
+  const axesHelper = new THREE.AxesHelper(8);
+  scene.add(axesHelper);
+  
+  // Add gridHelper for better spatial reference
+  const gridHelper = new THREE.GridHelper(20, 20);
+  scene.add(gridHelper);
+  
+  // Add a boundary box to show the movement limits
+  const boundaryGeometry = new THREE.BoxGeometry(16, 16, 16);
+  const boundaryMaterial = new THREE.MeshBasicMaterial({ 
+    color: 0xffffff, 
+    wireframe: true, 
+    transparent: true, 
+    opacity: 0.1 
+  });
+  const boundaryBox = new THREE.Mesh(boundaryGeometry, boundaryMaterial);
+  scene.add(boundaryBox);
+  
+  // Handle window resize
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+  
+  // Get control elements
+  const resetBtn = document.getElementById('resetBtn');
+  const lockPosition = document.getElementById('lockPosition');
+  const moveSensitivity = document.getElementById('moveSensitivity');
+  const rotSensitivity = document.getElementById('rotSensitivity');
+  
+  // Reset button handler
+  resetBtn.addEventListener('click', () => {
+    cube.position.set(initialPosition.x, initialPosition.y, initialPosition.z);
+    cube.rotation.set(0, 0, 0);
+  });
+  
+  // Low-pass filter for smoother motion
+  function lowPassFilter(oldValue, newValue, alpha = 0.2) {
+    return oldValue * (1 - alpha) + newValue * alpha;
+  }
+  
+  // Animation function
   function animate() {
     requestAnimationFrame(animate);
     renderer.render(scene, camera);
   }
   animate();
-
-  // WebSocket connection
+  
+  // WebSocket connection for sensor data
   const socket = new WebSocket('ws://localhost:6789');
-
+  const sensorDisplay = document.getElementById('sensorData');
+  
   socket.onopen = () => {
     console.log("✅ WebSocket connected");
+    sensorDisplay.textContent = "Connected, waiting for data...";
   };
-
+  
+  // Track raw values for display and filtering
+  let rawValues = [0, 0, 0, 0, 0, 0];
+  let filteredAccel = { x: 0, y: 0, z: 0 };
+  
+  // Auto-calibration function - call after connecting
+  function calibrateSensor(readings, samples = 10) {
+    let calValues = { ax: 0, ay: 0, az: 0 };
+    let count = 0;
+    
+    // Read several samples to get average rest position
+    function collectSample(data) {
+      if (count < samples) {
+        calValues.ax += data[0];
+        calValues.ay += data[1];
+        calValues.az += data[2];
+        count++;
+        return false;
+      } else {
+        // Calculate average
+        calibration.ax = calValues.ax / samples;
+        calibration.ay = calValues.ay / samples;
+        calibration.az = calValues.az / samples;
+        console.log("Calibration complete:", calibration);
+        return true;
+      }
+    }
+    
+    return collectSample;
+  }
+  
+  // Initialize auto-calibration
+  let isCalibrating = true;
+  let calibrationFn = calibrateSensor();
+  
   socket.onmessage = function(event) {
     try {
       const data = event.data.trim().split(',').map(Number);
       if (data.length === 6 && data.every(n => !isNaN(n))) {
-        const [gx, gy, gz] = data;
-
-        // Scale to adjust sensitivity
-        const factor = 0.001;
-        cube.rotation.x += gx * factor;
-        cube.rotation.y += gy * factor;
-        cube.rotation.z += gz * factor;
+        const [ax, ay, az, gx, gy, gz] = data;
+        rawValues = [ax, ay, az, gx, gy, gz];
+        
+        // Handle calibration if needed
+        if (isCalibrating) {
+          if (calibrationFn(data)) {
+            isCalibrating = false;
+            sensorDisplay.textContent = "Calibration complete!";
+          } else {
+            sensorDisplay.textContent = "Calibrating sensor...";
+            return;
+          }
+        }
+        
+        // Display the values
+        sensorDisplay.textContent = `A: ${ax.toFixed(2)}, ${ay.toFixed(2)}, ${az.toFixed(2)} | G: ${gx.toFixed(2)}, ${gy.toFixed(2)}, ${gz.toFixed(2)}`;
+        
+        // Calculate acceleration relative to calibration
+        const relAx = ax - calibration.ax;
+        const relAy = ay - calibration.ay;
+        const relAz = az - calibration.az;
+        
+        // Apply low-pass filter to acceleration for smoother motion
+        filteredAccel.x = lowPassFilter(filteredAccel.x, relAx);
+        filteredAccel.y = lowPassFilter(filteredAccel.y, relAy);
+        filteredAccel.z = lowPassFilter(filteredAccel.z, relAz);
+        
+        // Get sensitivity values from sliders
+        const moveScale = moveSensitivity.value / 100;
+        const rotScale = rotSensitivity.value / 1000;
+        
+        // Move the cube based on accelerometer data
+        cube.position.x += filteredAccel.x * moveScale;
+        cube.position.y += filteredAccel.y * moveScale;
+        
+        // Only move Z if not locked
+        if (!lockPosition.checked) {
+          cube.position.z += filteredAccel.z * moveScale;
+        }
+        
+        // Constrain position to boundary box
+        const limit = 7;
+        cube.position.x = Math.max(-limit, Math.min(limit, cube.position.x));
+        cube.position.y = Math.max(-limit, Math.min(limit, cube.position.y));
+        cube.position.z = Math.max(-limit, Math.min(limit, cube.position.z));
+        
+        // Rotate the cube based on gyroscope data
+        cube.rotation.x += gx * rotScale;
+        cube.rotation.y += gy * rotScale;
+        cube.rotation.z += gz * rotScale;
+        
+        // Normalize rotations to prevent overflow
+        cube.rotation.x %= Math.PI * 2;
+        cube.rotation.y %= Math.PI * 2;
+        cube.rotation.z %= Math.PI * 2;
       }
     } catch (err) {
       console.error("Invalid data:", event.data, err);
+      sensorDisplay.textContent = "Error processing data";
     }
   };
-
+  
   socket.onerror = (err) => {
     console.error("WebSocket error:", err);
+    sensorDisplay.textContent = "Connection error";
   };
-
+  
   socket.onclose = () => {
     console.warn("⚠️ WebSocket connection closed");
+    sensorDisplay.textContent = "Connection closed";
   };
 </script>
 </body>

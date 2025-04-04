@@ -4,10 +4,11 @@ import websockets
 
 clients = set()
 
-async def sender(websocket, path):
+async def sender(websocket):
+    # Removed the 'path' parameter that was causing the error
     clients.add(websocket)
     try:
-        await asyncio.Future()
+        await asyncio.Future()  # Keep the connection alive
     finally:
         clients.remove(websocket)
 
